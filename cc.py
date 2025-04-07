@@ -1,133 +1,207 @@
-import telebot
-import stripe
-import random
+# fullbot.py
+import logging, stripe, random, re
+from telegram import Update
+from telegram.ext import Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 
-# === CONFIGURATION ===
-stripe.api_key = 'sk_test_51RB9omPrntIzgnG70QJ0bIqdGMGU7rOWsKlTrTUCJxYrS7j8BN1kUA3fhcbjEEDVa5xUTnyKpk7gbfLRhmCowBqH00uVirKqX6'  # Replace this
-bot = telebot.TeleBot('7964928255:AAFOsLr9zDbLQXoZMxrhFzd54uJEzgd33QE')  # Replace this
-OWNER_ID = 930577300  # Your Telegram user ID
+# ========== CONFIG ==========
+OWNER_ID = 930577300
+BOT_TOKEN = "7964928255:AAFOsLr9zDbLQXoZMxrhFzd54uJEzgd33QE"
+STRIPE_API_KEY = "sk_test_51RB9omPrntIzgnG70QJ0bIqdGMGU7rOWsKlTrTUCJxYrS7j8BN1kUA3fhcbjEEDVa5xUTnyKpk7gbfLRhmCowBqH00uVirKqX6"
 
-# === DATA ===
-us_states = [
-    ("New York", "NY", "10001"),
-    ("Los Angeles", "CA", "90001"),
-    ("Houston", "TX", "77001"),
-    ("Chicago", "IL", "60601"),
-    ("Phoenix", "AZ", "85001"),
-    ("Miami", "FL", "33101"),
-    ("Denver", "CO", "80201"),
-    ("Seattle", "WA", "98101")
-]
+stripe.api_key = STRIPE_API_KEY
+approved_users = set([OWNER_ID])
+redeem_keys = {}
 
-first_names = ["John", "Mike", "Anna", "Emily", "Chris", "Sarah", "David", "Laura"]
-last_names = ["Smith", "Johnson", "Brown", "Garcia", "Martinez", "Miller", "Davis"]
+# ========== LOGGING ==========
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# === FUNCTIONS ===
-def generate_address():
-    name = f"{random.choice(first_names)} {random.choice(last_names)}"
-    street = f"{random.randint(100,9999)} {random.choice(['Main St', '2nd St', 'Maple Ave', 'Broadway'])}"
-    city, state, zip_code = random.choice(us_states)
-    return f"{name}\n{street}\n{city}, {state} {zip_code}\nUnited States"
+# ========== ACCESS UTILS ==========
+def is_owner(uid): return uid == OWNER_ID
+def is_approved(uid): return uid in approved_users
 
-def generate_cc(bin_format, amount):
-    cards = []
-    for _ in range(int(amount)):
-        cc = ""
-        for char in bin_format:
-            cc += str(random.randint(0, 9)) if char == "x" else char
-        mm = str(random.randint(1, 12)).zfill(2)
-        yy = str(random.randint(26, 29))
-        cvv = str(random.randint(100, 999))
-        cards.append(f"{cc}|{mm}|20{yy}|{cvv}")
-    return cards
+# ========== COMMANDS ==========
 
-def check_cc(card):
+def start(update: Update, context: CallbackContext):
+    update.message.reply_text("PYSCHO — Use /help to see all commands.")
+
+def help_command(update: Update, context: CallbackContext):
+    help_text = """❓ Help - Command List ❓
+
+🌟 General Commands 🌟
+🚀 /start - Greet me and get started!
+✅ /check <card> - Check a single card
+🔍 /mcheck <cards> - Check multiple cards (max 1000)
+💳 /s1 <card> - Check a single card (Stripe $1)
+💳 /ms1 <cards> - Check multiple cards (Stripe $1)
+🎲 /gen <BIN> or <BIN>|<MM>|<YY>|<CVV> - Generate credit cards
+ℹ️ /bin <BIN> - Get BIN information
+🏠 /address <countrycode> - Generate a random address
+🔑 /redeem <code> - Redeem a code for access
+💰 /plan - View pricing plans
+❓ /help - Show this command list
+📤 Send .txt - Check cards from file
+
+🔒 Admin Only 🔒
+👥 /userlist - List approved users
+🎟️ /generate - Generate a redeem code
+✅ /approve <userid> - Approve a user
+❌ /remove <userid> - Remove a user
+📢 /broadcast <message> - Broadcast to all users
+🔐 /keylist - Show active keys
+🗑️ /rmkey <key> - Remove redeem key
+"""
+    update.message.reply_text(help_text)
+
+def redeem(update: Update, context: CallbackContext):
+    user_id = update.effective_user.id
+    if not context.args: return update.message.reply_text("Usage: /redeem <code>")
+    code = context.args[0]
+    if code in redeem_keys:
+        approved_users.add(user_id)
+        del redeem_keys[code]
+        update.message.reply_text("✅ Access granted.")
+    else:
+        update.message.reply_text("❌ Invalid code.")
+
+# ========== STRIPE CHARGE ==========
+def s1(update: Update, context: CallbackContext):
+    uid = update.effective_user.id
+    if not is_approved(uid): return update.message.reply_text("❌ Access denied.")
+    if not context.args: return update.message.reply_text("Usage: /s1 <cc|mm|yy|cvv>")
+
+    cc = context.args[0]
+    parts = cc.split('|')
+    if len(parts) != 4: return update.message.reply_text("❌ Invalid format. Use cc|mm|yy|cvv")
+    number, mm, yy, cvv = parts
+
     try:
-        cc, mm, yy, cvv = card.strip().split("|")
-        pm = stripe.PaymentMethod.create(
-            type="card",
-            card={
-                "number": cc,
+        token = stripe.Token.create(card={
+            "number": number,
+            "exp_month": int(mm),
+            "exp_year": int(yy),
+            "cvc": cvv,
+        })
+        charge = stripe.Charge.create(
+            amount=100,
+            currency="usd",
+            source=token.id,
+            description="PYSCHO - Stripe $1 Auth",
+            capture=False
+        )
+        msg = f"{cc} - ✅ Approved (Status: {charge['status']})" if charge['status'] == 'succeeded' else f"{cc} - ❌ Declined (Status: {charge['status']})"
+        update.message.reply_text(msg)
+    except stripe.error.CardError as e:
+        update.message.reply_text(f"{cc} - ❌ Declined: {e.user_message}")
+    except Exception as e:
+        update.message.reply_text(f"{cc} - ❌ Error: {str(e)}")
+
+def ms1(update: Update, context: CallbackContext):
+    uid = update.effective_user.id
+    if not is_approved(uid): return update.message.reply_text("❌ Access denied.")
+    if not context.args: return update.message.reply_text("Usage: /ms1 <ccs>")
+
+    cards = ' '.join(context.args).split()
+    responses = []
+    for cc in cards[:1000]:
+        try:
+            number, mm, yy, cvv = cc.split('|')
+            token = stripe.Token.create(card={
+                "number": number,
                 "exp_month": int(mm),
                 "exp_year": int(yy),
                 "cvc": cvv,
-            },
-        )
-        customer = stripe.Customer.create(payment_method=pm.id)
-        stripe.PaymentIntent.create(
-            amount=100,
-            currency='usd',
-            customer=customer.id,
-            payment_method=pm.id,
-            off_session=True,
-            confirm=True,
-        )
-        return f"✅ Approved | {cc}|{mm}|{yy}|{cvv}"
-    except stripe.error.CardError:
-        return f"❌ Declined | {cc}|{mm}|{yy}|{cvv}"
-    except Exception:
-        return f"❌ Declined | {cc}|{mm}|{yy}|{cvv}"
+            })
+            charge = stripe.Charge.create(
+                amount=100,
+                currency="usd",
+                source=token.id,
+                description="PYSCHO - Stripe $1 Auth",
+                capture=False
+            )
+            status = charge['status']
+            msg = f"{cc} - ✅ Approved" if status == 'succeeded' else f"{cc} - ❌ Declined"
+        except stripe.error.CardError as e:
+            msg = f"{cc} - ❌ {e.user_message}"
+        except Exception as e:
+            msg = f"{cc} - ❌ Error"
+        responses.append(msg)
 
-# === BOT COMMANDS ===
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    bot.reply_to(message, (
-        "Welcome to Real CC Checker Bot.\n\n"
-        "Commands:\n"
-        "/chk <cc>\n"
-        "/mchk\n"
-        "/ch <cc>\n"
-        "/gen <bin> <amount>\n"
-        "/genaddress"
-    ))
+    # Telegram message limit: 40 lines
+    for i in range(0, len(responses), 40):
+        update.message.reply_text("\n".join(responses[i:i+40]))
 
-@bot.message_handler(commands=['chk'])
-def single_check(message):
-    try:
-        card = message.text.split(" ", 1)[1]
-        result = check_cc(card)
-        bot.reply_to(message, result)
-    except:
-        bot.reply_to(message, "Format: /chk 4242424242424242|12|2025|123")
+# ========== ADMIN COMMANDS ==========
+def generate(update: Update, context: CallbackContext):
+    if not is_owner(update.effective_user.id): return
+    key = ''.join(random.choices('ABCDEFGH0123456789', k=10))
+    redeem_keys[key] = True
+    update.message.reply_text(f"🎟️ Code: `{key}`", parse_mode='Markdown')
 
-@bot.message_handler(commands=['mchk'])
-def multi_check(message):
-    try:
-        cards = message.text.split("\n")[1:]
-        for cc in cards:
-            result = check_cc(cc)
-            bot.send_message(message.chat.id, result)
-    except:
-        bot.reply_to(message, "Usage:\n/mchk\ncard1|mm|yy|cvv\ncard2|mm|yy|cvv")
+def approve(update: Update, context: CallbackContext):
+    if not is_owner(update.effective_user.id): return
+    if not context.args: return update.message.reply_text("Usage: /approve <user_id>")
+    uid = int(context.args[0])
+    approved_users.add(uid)
+    update.message.reply_text(f"✅ User {uid} approved.")
 
-@bot.message_handler(commands=['ch'])
-def charge_card(message):
-    if message.from_user.id != OWNER_ID:
-        return bot.reply_to(message, "Unauthorized.")
-    try:
-        card = message.text.split(" ", 1)[1]
-        result = check_cc(card)
-        bot.reply_to(message, result)
-    except:
-        bot.reply_to(message, "Format: /ch 4242424242424242|12|2025|123")
+def remove(update: Update, context: CallbackContext):
+    if not is_owner(update.effective_user.id): return
+    if not context.args: return update.message.reply_text("Usage: /remove <user_id>")
+    uid = int(context.args[0])
+    approved_users.discard(uid)
+    update.message.reply_text(f"❌ User {uid} removed.")
 
-@bot.message_handler(commands=['gen'])
-def generate_bins(message):
-    try:
-        args = message.text.split()
-        if len(args) < 3:
-            return bot.reply_to(message, "Usage: /gen <bin> <amount>\nExample: /gen 440644xxxxxxxxxx 5")
-        bin_pattern = args[1]
-        quantity = args[2]
-        cards = generate_cc(bin_pattern, quantity)
-        bot.reply_to(message, "\n".join(cards[:20]))
-    except Exception as e:
-        bot.reply_to(message, f"Error: {str(e)}")
+def userlist(update: Update, context: CallbackContext):
+    if not is_owner(update.effective_user.id): return
+    update.message.reply_text("Approved Users:\n" + "\n".join(str(u) for u in approved_users))
 
-@bot.message_handler(commands=['genaddress'])
-def send_address(message):
-    addr = generate_address()
-    bot.reply_to(message, f"Random Billing Address:\n\n{addr}")
+def keylist(update: Update, context: CallbackContext):
+    if not is_owner(update.effective_user.id): return
+    if not redeem_keys:
+        update.message.reply_text("No active keys.")
+    else:
+        update.message.reply_text("Active Keys:\n" + "\n".join(redeem_keys.keys()))
 
-# === START BOT ===
-bot.infinity_polling()
+def rmkey(update: Update, context: CallbackContext):
+    if not is_owner(update.effective_user.id): return
+    if not context.args: return update.message.reply_text("Usage: /rmkey <key>")
+    key = context.args[0]
+    if key in redeem_keys:
+        del redeem_keys[key]
+        update.message.reply_text("Key removed.")
+    else:
+        update.message.reply_text("Key not found.")
+
+def broadcast(update: Update, context: CallbackContext):
+    if not is_owner(update.effective_user.id): return
+    msg = " ".join(context.args)
+    for uid in approved_users:
+        try:
+            context.bot.send_message(chat_id=uid, text=f"[Broadcast] {msg}")
+        except: pass
+    update.message.reply_text("Broadcast sent.")
+
+# ========== MAIN ==========
+def main():
+    updater = Updater(BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("start", start))
+    dp.add_handler(CommandHandler("help", help_command))
+    dp.add_handler(CommandHandler("redeem", redeem))
+    dp.add_handler(CommandHandler("s1", s1))
+    dp.add_handler(CommandHandler("ms1", ms1))
+    dp.add_handler(CommandHandler("generate", generate))
+    dp.add_handler(CommandHandler("approve", approve))
+    dp.add_handler(CommandHandler("remove", remove))
+    dp.add_handler(CommandHandler("userlist", userlist))
+    dp.add_handler(CommandHandler("keylist", keylist))
+    dp.add_handler(CommandHandler("rmkey", rmkey))
+    dp.add_handler(CommandHandler("broadcast", broadcast))
+
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == "__main__":
+    main()
